@@ -1,28 +1,40 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CLOUD_LIMIT_FT, CloudMode, Evaluation, ParsedMetar, VIS_LIMIT_M, evaluate, parseMetar } from "./lib/metar";
+import { Evaluation, ParsedMetar, evaluate, parseMetar } from "./lib/metar";
 import { PageReading, ReadError, ReaderStatus, SOURCE_URL, getCustomProxy, readSourcePage, setCustomProxy } from "./lib/source";
+import {
+  DEFAULT_SETTINGS,
+  Settings,
+  cloudModeLabel,
+  describeChanges,
+  fmtCloudLimit,
+  fmtInterval,
+  fmtVisLimit,
+  loadSettings,
+  saveSettings,
+} from "./lib/settings";
+import SettingsPanel from "./components/SettingsPanel";
 import { isAudioReady, startAlarm, stopAlarm, unlockAudio } from "./lib/alarm";
 import { cn } from "./utils/cn";
 
-const REFRESH_MS = 5 * 60 * 1000; // odczyt strony co 5 minut
 const RETRY_MS = 60 * 1000; // po nieudanym odczycie — ponowienie po minucie
-const STALE_WARN_MS = 12 * 60 * 1000;
-const LS_LOG = "eppw-log-v1";
+const LS_LOG = "eppw-log-v2";
 const LS_PREV = "eppw-prev-v1";
-const LS_MODE = "eppw-mode-v1";
 const LS_LASTOBS = "eppw-lastobs-v1";
 
-type Param = "VIS" | "CLD";
+type Param = "VIS" | "CLD" | "CFG";
 interface LogEntry {
   id: string;
   detectedAt: string;
   metarTime: string | null;
   param: Param;
-  direction: "down" | "up";
+  direction: "down" | "up" | "cfg";
   value: string;
   raw: string;
   ackAt?: string;
   simulated?: boolean;
+  /** Progi obowiązujące w chwili zdarzenia — dzięki temu dziennik pozostaje czytelny po ich zmianie. */
+  visLimitM?: number;
+  cloudLimitFt?: number;
 }
 
 const fmtUTC = (d: Date) =>
@@ -49,6 +61,7 @@ function load<T>(key: string, fallback: T): T {
 }
 
 export default function App() {
+  const [settings, setSettings] = useState<Settings>(() => loadSettings());
   const [metar, setMetar] = useState<ParsedMetar | null>(null);
   const [reading, setReading] = useState<PageReading | null>(null);
   const [statuses, setStatuses] = useState<ReaderStatus[]>([]);
@@ -59,50 +72,50 @@ export default function App() {
   const [errorDetails, setErrorDetails] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
   const [log, setLog] = useState<LogEntry[]>(() => load(LS_LOG, []));
-  const [mode, setMode] = useState<CloudMode>(() => load(LS_MODE, "ceiling"));
   const [alarm, setAlarm] = useState<LogEntry[] | null>(null);
   const [armed, setArmed] = useState(false);
   const [sim, setSim] = useState("EPPW 171400Z 24008KT 2500 BR BKN002 08/07 Q1012");
   const [customProxy, setCustomProxyInput] = useState(() => getCustomProxy());
 
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const metarRef = useRef<ParsedMetar | null>(null);
+  metarRef.current = metar;
   const prevRef = useRef<Evaluation | null>(load<Evaluation | null>(LS_PREV, null));
   const lastRawRef = useRef<string>("");
   const lastObsRef = useRef<number | null>(load<number | null>(LS_LASTOBS, null));
+  const lastAttemptRef = useRef<number | null>(null);
   const loadingRef = useRef(false);
   const nextFetchRef = useRef<number>(0);
   const failStreak = useRef(0);
   const staleStreak = useRef(0);
-  const modeRef = useRef(mode);
-  modeRef.current = mode;
 
   useEffect(() => localStorage.setItem(LS_LOG, JSON.stringify(log)), [log]);
-  useEffect(() => localStorage.setItem(LS_MODE, JSON.stringify(mode)), [mode]);
 
-  const evaluation = useMemo(() => (metar ? evaluate(metar, mode) : null), [metar, mode]);
+  const evaluation = useMemo(() => (metar ? evaluate(metar, settings.cloudMode, settings) : null), [metar, settings]);
   const below = !!evaluation && (evaluation.visBelow === true || evaluation.cloudBelow === true);
+  const visLabel = fmtVisLimit(settings.visLimitM);
+  const cloudLabel = fmtCloudLimit(settings.cloudLimitFt);
+  const intervalLabel = fmtInterval(settings.refreshSec);
 
   /** Porównuje nową depeszę z poprzednim stanem i w razie przejścia przez próg uruchamia alarm. */
   const process = useCallback((raw: string, simulated = false) => {
     if (!simulated && raw === lastRawRef.current) return;
     lastRawRef.current = raw;
+    const cfg = settingsRef.current;
     const p = parseMetar(raw);
-    const ev = evaluate(p, modeRef.current);
+    const ev = evaluate(p, cfg.cloudMode, cfg);
     setMetar(p);
     const prev = prevRef.current;
     const events: LogEntry[] = [];
     const stamp = new Date().toISOString();
+    const base = { detectedAt: stamp, metarTime: p.obsTime, raw, simulated, visLimitM: cfg.visLimitM, cloudLimitFt: cfg.cloudLimitFt };
     if (prev) {
       if (prev.visBelow !== null && ev.visBelow !== null && prev.visBelow !== ev.visBelow) {
-        events.push({
-          id: crypto.randomUUID(), detectedAt: stamp, metarTime: p.obsTime, param: "VIS",
-          direction: ev.visBelow ? "down" : "up", value: fmtVis(p.visibilityM, p.cavok), raw, simulated,
-        });
+        events.push({ ...base, id: crypto.randomUUID(), param: "VIS", direction: ev.visBelow ? "down" : "up", value: fmtVis(p.visibilityM, p.cavok) });
       }
       if (prev.cloudBelow !== null && ev.cloudBelow !== null && prev.cloudBelow !== ev.cloudBelow) {
-        events.push({
-          id: crypto.randomUUID(), detectedAt: stamp, metarTime: p.obsTime, param: "CLD",
-          direction: ev.cloudBelow ? "down" : "up", value: fmtCloud(ev.cloudBaseFt), raw, simulated,
-        });
+        events.push({ ...base, id: crypto.randomUUID(), param: "CLD", direction: ev.cloudBelow ? "down" : "up", value: fmtCloud(ev.cloudBaseFt) });
       }
     }
     prevRef.current = ev;
@@ -113,7 +126,12 @@ export default function App() {
       startAlarm();
       if ("Notification" in window && Notification.permission === "granted") {
         new Notification("EPPW – zmiana warunków", {
-          body: events.map((e) => `${e.param === "VIS" ? "Widzialność" : "Podstawa chmur"} ${e.direction === "down" ? "PONIŻEJ" : "POWYŻEJ"} progu: ${e.value}`).join("\n"),
+          body: events
+            .map((e) => {
+              const lim = e.param === "VIS" ? fmtVisLimit(e.visLimitM ?? cfg.visLimitM) : fmtCloudLimit(e.cloudLimitFt ?? cfg.cloudLimitFt);
+              return `${e.param === "VIS" ? "Widzialność" : "Podstawa chmur"} ${e.direction === "down" ? "PONIŻEJ" : "POWYŻEJ"} ${lim}: ${e.value}`;
+            })
+            .join("\n"),
         });
       }
     }
@@ -124,8 +142,9 @@ export default function App() {
     if (loadingRef.current) return;
     loadingRef.current = true;
     setLoading(true);
-    nextFetchRef.current = Date.now() + REFRESH_MS;
-    let next = REFRESH_MS;
+    const intervalMs = settingsRef.current.refreshSec * 1000;
+    nextFetchRef.current = Date.now() + intervalMs;
+    let next = intervalMs;
     try {
       const r = await readSourcePage({
         // po 3 kolejnych "starszych kopiach" z rzędu akceptujemy to, co zgodnie pokazują czytniki
@@ -146,7 +165,7 @@ export default function App() {
       process(r.raw);
     } catch (e) {
       failStreak.current += 1;
-      next = RETRY_MS;
+      next = Math.min(RETRY_MS, settingsRef.current.refreshSec * 1000);
       if (e instanceof ReadError && e.stale) {
         staleStreak.current += 1;
         setError(`Odczytana strona pokazuje starszą depeszę niż już znana — odczyt pominięty (próba ${staleStreak.current}/3, potem zaakceptuję stan ze strony).`);
@@ -155,7 +174,8 @@ export default function App() {
       }
       setErrorDetails((e as Error).message);
     } finally {
-      nextFetchRef.current = Date.now() + next;
+      lastAttemptRef.current = Date.now();
+      nextFetchRef.current = lastAttemptRef.current + next;
       setNextFetch(nextFetchRef.current);
       loadingRef.current = false;
       setLoading(false);
@@ -167,6 +187,7 @@ export default function App() {
     void refresh();
     const id = setInterval(() => {
       setNow(Date.now());
+      setNextFetch(nextFetchRef.current);
       if (Date.now() >= nextFetchRef.current && !loadingRef.current) void refresh();
     }, 1000);
     const onVisible = () => {
@@ -182,7 +203,7 @@ export default function App() {
   // Migający tytuł karty podczas alarmu
   useEffect(() => {
     if (!alarm) {
-      document.title = below ? "▼ EPPW poniżej minimów – Strażnik Minimów" : "EPPW Strażnik Minimów – 3 km / 300 ft";
+      document.title = below ? `▼ EPPW poniżej minimów – ${visLabel} / ${cloudLabel}` : `EPPW Strażnik Minimów – ${visLabel} / ${cloudLabel}`;
       return;
     }
     let on = false;
@@ -191,7 +212,47 @@ export default function App() {
       document.title = on ? "🚨 ALARM EPPW – naciśnij RESET" : "EPPW – zmiana warunków";
     }, 800);
     return () => clearInterval(id);
-  }, [alarm, below]);
+  }, [alarm, below, visLabel, cloudLabel]);
+
+  /**
+   * Zapis nowych ustawień: przelicza stan odniesienia (bez fałszywego alarmu),
+   * dopisuje wpis do dziennika i natychmiast przestawia harmonogram odczytów.
+   */
+  const applySettings = useCallback((next: Settings) => {
+    const prev = settingsRef.current;
+    const changes = describeChanges(prev, next);
+    if (!changes.length) return;
+    settingsRef.current = next;
+    setSettings(next);
+    saveSettings(next);
+
+    const m = metarRef.current;
+    if (m) {
+      const ev = evaluate(m, next.cloudMode, next);
+      prevRef.current = ev;
+      localStorage.setItem(LS_PREV, JSON.stringify(ev));
+    }
+
+    setLog((l) => [
+      {
+        id: crypto.randomUUID(),
+        detectedAt: new Date().toISOString(),
+        metarTime: m?.obsTime ?? null,
+        param: "CFG",
+        direction: "cfg",
+        value: changes.join(" · "),
+        raw: m?.raw ?? "",
+        visLimitM: next.visLimitM,
+        cloudLimitFt: next.cloudLimitFt,
+      },
+      ...l,
+    ]);
+
+    // nowy odstęp liczony od ostatniej próby odczytu — skrócenie czasu działa od razu
+    const base = lastAttemptRef.current ?? Date.now();
+    nextFetchRef.current = base + next.refreshSec * 1000;
+    setNextFetch(nextFetchRef.current);
+  }, []);
 
   const reset = () => {
     stopAlarm();
@@ -211,16 +272,6 @@ export default function App() {
     }
   };
 
-  const changeMode = (m: CloudMode) => {
-    setMode(m);
-    modeRef.current = m;
-    if (metar) {
-      const ev = evaluate(metar, m);
-      prevRef.current = ev;
-      localStorage.setItem(LS_PREV, JSON.stringify(ev));
-    }
-  };
-
   const saveCustomProxy = () => {
     setCustomProxy(customProxy);
     setCustomProxyInput(getCustomProxy());
@@ -233,11 +284,19 @@ export default function App() {
   };
 
   const exportCsv = () => {
-    const head = ["Wykryto UTC", "Wykryto czas lokalny", "Czas METAR", "Parametr", "Kierunek", "Wartość", "Potwierdzono (RESET) UTC", "Symulacja", "METAR"];
+    const head = ["Wykryto UTC", "Wykryto czas lokalny", "Czas METAR", "Parametr", "Kierunek", "Wartość", "Próg widzialności", "Próg podstawy chmur", "Potwierdzono (RESET) UTC", "Symulacja", "METAR"];
     const rows = log.map((e) => [
-      fmtUTC(new Date(e.detectedAt)), fmtLocal(new Date(e.detectedAt)), e.metarTime ?? "",
-      e.param === "VIS" ? "Widzialność" : "Podstawa chmur", e.direction === "down" ? "Pogorszenie (poniżej)" : "Poprawa (powyżej)",
-      e.value, e.ackAt ? fmtUTC(new Date(e.ackAt)) : "", e.simulated ? "TAK" : "", e.raw,
+      fmtUTC(new Date(e.detectedAt)),
+      fmtLocal(new Date(e.detectedAt)),
+      e.metarTime ?? "",
+      e.param === "VIS" ? "Widzialność" : e.param === "CLD" ? "Podstawa chmur" : "Ustawienia",
+      e.param === "CFG" ? "zmiana konfiguracji" : e.direction === "down" ? "Pogorszenie (poniżej)" : "Poprawa (powyżej)",
+      e.value,
+      e.visLimitM ? fmtVisLimit(e.visLimitM) : "",
+      e.cloudLimitFt ? fmtCloudLimit(e.cloudLimitFt) : "",
+      e.ackAt ? fmtUTC(new Date(e.ackAt)) : "",
+      e.simulated ? "TAK" : "",
+      e.raw,
     ]);
     const csv = [head, ...rows].map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(";")).join("\n");
     const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
@@ -250,10 +309,14 @@ export default function App() {
   const countdown = mmss(nextFetch - now);
   const metarAgeMin = metar?.obsDate ? Math.round((now - metar.obsDate.getTime()) / 60000) : null;
   const okAge = lastOk ? now - lastOk.getTime() : null;
-  const dataStale = okAge !== null && okAge > STALE_WARN_MS;
+  const staleWarnMs = Math.max(2.5 * settings.refreshSec * 1000, 10 * 60 * 1000);
+  const dataStale = okAge !== null && okAge > staleWarnMs;
   const pageSays = reading
     ? (["WIDZIALNOŚĆ", "CHMURY", "POMIAR"] as const).filter((k) => reading.decoded[k]).map((k) => ({ k, v: reading.decoded[k] }))
     : [];
+  const visMax = Math.max(10000, Math.ceil((settings.visLimitM * 1.5) / 1000) * 1000);
+  const cloudMax = Math.max(1500, Math.ceil((settings.cloudLimitFt * 3) / 500) * 500);
+  const alarmCount = log.filter((e) => e.param !== "CFG").length;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 antialiased selection:bg-amber-400/30">
@@ -266,7 +329,7 @@ export default function App() {
               {alarm.map((a) => (
                 <p key={a.id} className="text-lg font-black sm:text-xl">
                   {a.param === "VIS" ? "Widzialność" : "Podstawa chmur"} {a.direction === "down" ? "spadła PONIŻEJ" : "wzrosła POWYŻEJ"}{" "}
-                  {a.param === "VIS" ? "3 km" : "300 ft"} → {a.value}
+                  {a.param === "VIS" ? fmtVisLimit(a.visLimitM ?? settings.visLimitM) : fmtCloudLimit(a.cloudLimitFt ?? settings.cloudLimitFt)} → {a.value}
                   <span className="ml-2 text-sm font-semibold text-red-100">(METAR {a.metarTime})</span>
                 </p>
               ))}
@@ -285,8 +348,9 @@ export default function App() {
             <span className="grid h-8 w-8 place-items-center rounded-lg bg-amber-400 text-slate-950">✈</span>
             <span>EPPW <span className="text-amber-400">Strażnik Minimów</span></span>
           </a>
-          <nav className="hidden gap-6 text-sm text-slate-400 md:flex">
+          <nav className="hidden gap-6 text-sm text-slate-400 lg:flex">
             <a href="#monitor" className="hover:text-white">Monitor</a>
+            <a href="#ustawienia" className="hover:text-white">Ustawienia</a>
             <a href="#dziennik" className="hover:text-white">Dziennik</a>
             <a href="#jak" className="hover:text-white">Jak to działa</a>
             <a href="#zrodlo" className="hover:text-white">Źródło danych</a>
@@ -303,16 +367,17 @@ export default function App() {
           <div className="relative mx-auto grid max-w-6xl gap-10 px-4 pb-12 pt-14 lg:grid-cols-[1.2fr_1fr] lg:pt-20">
             <div>
               <p className="mb-4 inline-flex items-center gap-2 rounded-full border border-amber-400/30 bg-amber-400/10 px-3 py-1 text-xs font-semibold uppercase tracking-widest text-amber-300">
-                Lotnisko Powidz · EPPW · METAR odczytywany ze strony co 5 min
+                Lotnisko Powidz · EPPW · METAR odczytywany ze strony co {intervalLabel}
               </p>
               <h1 className="text-4xl font-black leading-tight tracking-tight sm:text-5xl lg:text-6xl">
                 Nie musisz wpatrywać się w depesze.{" "}
                 <span className="text-amber-400">Usłyszysz każdą zmianę.</span>
               </h1>
               <p className="mt-5 max-w-xl text-lg text-slate-300">
-                Strażnik Minimów co 5 minut odczytuje stronę metar.czad.org/EPPW i pilnuje dwóch granic:{" "}
-                <strong className="text-white">widzialności 3 km</strong> i <strong className="text-white">podstawy chmur 300 ft</strong>.
+                Strażnik Minimów co {intervalLabel} odczytuje stronę metar.czad.org/EPPW i pilnuje dwóch granic:{" "}
+                <strong className="text-white">widzialności {visLabel}</strong> i <strong className="text-white">podstawy chmur {cloudLabel}</strong>.
                 Gdy warunki spadną poniżej lub wrócą powyżej progu — rozlega się alarm, a dokładny czas zmiany trafia do dziennika.
+                Progi i częstotliwość odczytu <a href="#ustawienia" className="text-amber-400 underline decoration-amber-400/40 hover:decoration-amber-400">ustawisz pod monitorem</a>.
               </p>
               <div className="mt-8 flex flex-wrap gap-3">
                 {!armed ? (
@@ -334,10 +399,10 @@ export default function App() {
             </div>
 
             <div className="grid grid-cols-2 gap-3 self-center">
-              <HeroStat label="Próg widzialności" value="3 km" sub="3000 m" />
-              <HeroStat label="Próg podstawy chmur" value="300 ft" sub="BKN / OVC / VV" />
-              <HeroStat label="Odczyt strony" value="5 min" sub={loading ? "trwa odczyt…" : `następny za ${countdown}`} />
-              <HeroStat label="Zapisane zmiany" value={String(log.length)} sub="w tej przeglądarce" />
+              <HeroStat label="Próg widzialności" value={visLabel} sub={`${settings.visLimitM} m`} href="#ustawienia" />
+              <HeroStat label="Próg podstawy chmur" value={cloudLabel} sub={settings.cloudMode === "ceiling" ? "BKN / OVC / VV" : "każda warstwa"} href="#ustawienia" />
+              <HeroStat label="Odczyt strony" value={intervalLabel} sub={loading ? "trwa odczyt…" : `następny za ${countdown}`} href="#ustawienia" />
+              <HeroStat label="Zapisane zmiany" value={String(alarmCount)} sub="w tej przeglądarce" href="#dziennik" />
             </div>
           </div>
         </section>
@@ -377,18 +442,18 @@ export default function App() {
                 <Gauge
                   title="Widzialność"
                   value={metar ? fmtVis(metar.visibilityM, metar.cavok) : "—"}
-                  limit="próg 3 km"
+                  limit={`próg ${visLabel}`}
                   state={evaluation?.visBelow ?? null}
-                  ratio={metar?.visibilityM != null ? Math.min(1, metar.visibilityM / 10000) : 0}
-                  mark={VIS_LIMIT_M / 10000}
+                  ratio={metar?.visibilityM != null ? Math.min(1, metar.visibilityM / visMax) : 0}
+                  mark={settings.visLimitM / visMax}
                 />
                 <Gauge
-                  title={mode === "ceiling" ? "Podstawa chmur (pułap BKN/OVC/VV)" : "Podstawa najniższej warstwy chmur"}
+                  title={settings.cloudMode === "ceiling" ? "Podstawa chmur (pułap BKN/OVC/VV)" : "Podstawa najniższej warstwy chmur"}
                   value={evaluation ? fmtCloud(evaluation.cloudBaseFt) : "—"}
-                  limit="próg 300 ft"
+                  limit={`próg ${cloudLabel}`}
                   state={evaluation?.cloudBelow ?? null}
-                  ratio={evaluation ? (evaluation.cloudBaseFt === null ? 1 : Math.min(1, evaluation.cloudBaseFt / 1500)) : 0}
-                  mark={CLOUD_LIMIT_FT / 1500}
+                  ratio={evaluation ? (evaluation.cloudBaseFt === null ? 1 : Math.min(1, evaluation.cloudBaseFt / cloudMax)) : 0}
+                  mark={settings.cloudLimitFt / cloudMax}
                 />
               </div>
 
@@ -429,13 +494,10 @@ export default function App() {
                   )}
                   {" · "}źródło: <a href={SOURCE_URL} target="_blank" rel="noreferrer" className="underline hover:text-slate-300">metar.czad.org/EPPW ↗</a>
                 </span>
-                <label className="flex items-center gap-2">
-                  Licz podstawę chmur z:
-                  <select value={mode} onChange={(e) => changeMode(e.target.value as CloudMode)} className="rounded-lg border border-white/15 bg-slate-900 px-2 py-1 text-slate-200">
-                    <option value="ceiling">pułapu (BKN, OVC, VV)</option>
-                    <option value="any">każdej warstwy (także FEW, SCT)</option>
-                  </select>
-                </label>
+                <span>
+                  Aktywne progi: <b className="text-slate-300">{visLabel}</b> / <b className="text-slate-300">{cloudLabel}</b> ({cloudModeLabel(settings.cloudMode)}), odczyt co <b className="text-slate-300">{intervalLabel}</b>{" "}
+                  <a href="#ustawienia" className="text-amber-400 underline decoration-amber-400/40 hover:decoration-amber-400">zmień ↓</a>
+                </span>
               </div>
 
               {error && (
@@ -450,16 +512,26 @@ export default function App() {
           </div>
         </section>
 
+        {/* USTAWIENIA */}
+        <section id="ustawienia" className="mx-auto max-w-6xl scroll-mt-20 px-4 py-12">
+          <SectionHead
+            kicker="Ustawienia"
+            title="Dopasuj progi i częstotliwość odczytu"
+            text="Domyślnie Strażnik pilnuje 3 km i 300 ft, odczytując stronę co 5 minut. Jeśli Twoja procedura wymaga innych wartości — zmień je tutaj. Ustawienia obowiązują natychmiast i zostają zapamiętane w tej przeglądarce."
+          />
+          <SettingsPanel settings={settings} onApply={applySettings} />
+        </section>
+
         {/* DZIENNIK */}
         <section id="dziennik" className="mx-auto max-w-6xl scroll-mt-20 px-4 py-12">
-          <SectionHead kicker="Dziennik zmian" title="Każde przejście przez próg — z dokładną godziną" text="Wpis powstaje automatycznie w chwili wykrycia zmiany. Naciśnięcie RESET dopisuje godzinę potwierdzenia. Dziennik zostaje w przeglądarce także po odświeżeniu strony." />
+          <SectionHead kicker="Dziennik zmian" title="Każde przejście przez próg — z dokładną godziną" text="Wpis powstaje automatycznie w chwili wykrycia zmiany. Naciśnięcie RESET dopisuje godzinę potwierdzenia. Zapisywane są też zmiany ustawień, więc zawsze wiadomo, jakie progi obowiązywały o danej godzinie." />
           <div className="mb-4 flex flex-wrap gap-2">
             <button onClick={exportCsv} disabled={!log.length} className="rounded-xl bg-white px-4 py-2.5 text-sm font-bold text-slate-950 hover:bg-slate-200 disabled:opacity-40">⬇ Eksportuj CSV (Excel)</button>
             <button onClick={() => window.print()} disabled={!log.length} className="rounded-xl border border-white/15 px-4 py-2.5 text-sm font-semibold hover:bg-white/5 disabled:opacity-40">🖨 Drukuj</button>
             <button onClick={() => { if (confirm("Usunąć wszystkie wpisy z dziennika? Tej operacji nie można cofnąć.")) setLog([]); }} disabled={!log.length} className="rounded-xl border border-red-500/30 px-4 py-2.5 text-sm font-semibold text-red-300 hover:bg-red-500/10 disabled:opacity-40">Wyczyść dziennik</button>
           </div>
           <div className="overflow-x-auto rounded-2xl border border-white/10">
-            <table className="w-full min-w-[760px] text-left text-sm">
+            <table className="w-full min-w-[820px] text-left text-sm">
               <thead className="bg-white/5 text-xs uppercase tracking-wider text-slate-400">
                 <tr>
                   <th className="px-4 py-3">Wykryto (UTC)</th>
@@ -467,7 +539,7 @@ export default function App() {
                   <th className="px-4 py-3">METAR</th>
                   <th className="px-4 py-3">Parametr</th>
                   <th className="px-4 py-3">Zmiana</th>
-                  <th className="px-4 py-3">Wartość</th>
+                  <th className="px-4 py-3">Wartość / próg</th>
                   <th className="px-4 py-3">RESET</th>
                 </tr>
               </thead>
@@ -475,21 +547,37 @@ export default function App() {
                 {log.length === 0 && (
                   <tr><td colSpan={7} className="px-4 py-10 text-center text-slate-500">Brak zmian od rozpoczęcia monitorowania. Gdy warunki przekroczą próg, wpis pojawi się tutaj automatycznie.</td></tr>
                 )}
-                {log.map((e) => (
-                  <tr key={e.id} className="hover:bg-white/[0.03]" title={e.raw}>
-                    <td className="px-4 py-3 font-mono">{fmtUTC(new Date(e.detectedAt))}</td>
-                    <td className="px-4 py-3 font-mono text-slate-400">{fmtLocal(new Date(e.detectedAt))}</td>
-                    <td className="px-4 py-3 font-mono text-slate-400">{e.metarTime}</td>
-                    <td className="px-4 py-3">{e.param === "VIS" ? "Widzialność" : "Podstawa chmur"}{e.simulated && <span className="ml-2 rounded bg-slate-700 px-1.5 py-0.5 text-[10px] uppercase">test</span>}</td>
-                    <td className="px-4 py-3">
-                      <span className={cn("rounded-full px-2.5 py-1 text-xs font-bold", e.direction === "down" ? "bg-red-500/15 text-red-300" : "bg-emerald-500/15 text-emerald-300")}>
-                        {e.direction === "down" ? "▼ poniżej progu" : "▲ powyżej progu"}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 font-semibold">{e.value}</td>
-                    <td className="px-4 py-3 font-mono text-slate-400">{e.ackAt ? fmtUTC(new Date(e.ackAt)).replace(" UTC", "") : <span className="text-amber-400">oczekuje</span>}</td>
-                  </tr>
-                ))}
+                {log.map((e) =>
+                  e.param === "CFG" ? (
+                    <tr key={e.id} className="bg-white/[0.02] text-slate-400">
+                      <td className="px-4 py-3 font-mono">{fmtUTC(new Date(e.detectedAt))}</td>
+                      <td className="px-4 py-3 font-mono">{fmtLocal(new Date(e.detectedAt))}</td>
+                      <td className="px-4 py-3 font-mono">{e.metarTime ?? "—"}</td>
+                      <td className="px-4 py-3">Ustawienia</td>
+                      <td className="px-4 py-3"><span className="rounded-full bg-slate-700/60 px-2.5 py-1 text-xs font-bold text-slate-200">⚙ konfiguracja</span></td>
+                      <td className="px-4 py-3" colSpan={2}>{e.value}</td>
+                    </tr>
+                  ) : (
+                    <tr key={e.id} className="hover:bg-white/[0.03]" title={e.raw}>
+                      <td className="px-4 py-3 font-mono">{fmtUTC(new Date(e.detectedAt))}</td>
+                      <td className="px-4 py-3 font-mono text-slate-400">{fmtLocal(new Date(e.detectedAt))}</td>
+                      <td className="px-4 py-3 font-mono text-slate-400">{e.metarTime}</td>
+                      <td className="px-4 py-3">{e.param === "VIS" ? "Widzialność" : "Podstawa chmur"}{e.simulated && <span className="ml-2 rounded bg-slate-700 px-1.5 py-0.5 text-[10px] uppercase">test</span>}</td>
+                      <td className="px-4 py-3">
+                        <span className={cn("rounded-full px-2.5 py-1 text-xs font-bold", e.direction === "down" ? "bg-red-500/15 text-red-300" : "bg-emerald-500/15 text-emerald-300")}>
+                          {e.direction === "down" ? "▼ poniżej progu" : "▲ powyżej progu"}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className="font-semibold">{e.value}</span>
+                        <span className="ml-2 text-xs text-slate-500">
+                          próg {e.param === "VIS" ? fmtVisLimit(e.visLimitM ?? DEFAULT_SETTINGS.visLimitM) : fmtCloudLimit(e.cloudLimitFt ?? DEFAULT_SETTINGS.cloudLimitFt)}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 font-mono text-slate-400">{e.ackAt ? fmtUTC(new Date(e.ackAt)).replace(" UTC", "") : <span className="text-amber-400">oczekuje</span>}</td>
+                    </tr>
+                  ),
+                )}
               </tbody>
             </table>
           </div>
@@ -499,17 +587,33 @@ export default function App() {
         <section id="jak" className="mx-auto max-w-6xl scroll-mt-20 px-4 py-12">
           <SectionHead kicker="Jak to działa" title="Trzy kroki. Zero przeoczonych zmian." />
           <div className="grid gap-4 md:grid-cols-3">
-            <Step n="1" title="Otwórz i uzbrój" text="Otwórz stronę na początku zmiany i kliknij „Uzbrój alarm dźwiękowy”. Od tej chwili możesz zająć się innymi zadaniami — karta może działać w tle." />
-            <Step n="2" title="Strażnik czyta stronę co 5 minut" text="System odczytuje depeszę wprost ze strony metar.czad.org/EPPW i porównuje widzialność z progiem 3 km, a podstawę chmur z progiem 300 ft. Wynik widzisz od razu w kolorze." />
+            <Step n="1" title="Ustaw progi i uzbrój" text={`Sprawdź, czy progi (${visLabel} / ${cloudLabel}) i czas odczytu (${intervalLabel}) odpowiadają Twojej procedurze, a potem kliknij „Uzbrój alarm dźwiękowy”. Od tej chwili możesz zająć się innymi zadaniami.`} />
+            <Step n="2" title={`Strażnik czyta stronę co ${intervalLabel}`} text="System odczytuje depeszę wprost ze strony metar.czad.org/EPPW i porównuje widzialność oraz podstawę chmur z Twoimi progami. Wynik widzisz od razu w kolorze." />
             <Step n="3" title="Alarm → RESET → zapis" text="Gdy którakolwiek wartość przekroczy próg w dół lub w górę, rozlega się sygnał. Naciśnij RESET, by go wyciszyć. Czas zmiany i czas potwierdzenia są już w dzienniku." />
           </div>
 
           <div className="mt-10 grid gap-4 md:grid-cols-2">
-            <Rule tone="red" title="Alarm „pogorszenie” ▼" items={["widzialność spadła z ≥ 3000 m do < 3000 m", "podstawa chmur spadła z ≥ 300 ft do < 300 ft", "pojawiło się VV (niebo niewidoczne) poniżej 300 ft"]} />
-            <Rule tone="green" title="Alarm „poprawa” ▲" items={["widzialność wzrosła z < 3000 m do ≥ 3000 m (w tym CAVOK)", "podstawa chmur wzrosła z < 300 ft do ≥ 300 ft", "chmury poniżej progu ustąpiły (NSC, SKC, CAVOK)"]} />
+            <Rule
+              tone="red"
+              title="Alarm „pogorszenie” ▼"
+              items={[
+                `widzialność spadła z ≥ ${settings.visLimitM} m do < ${settings.visLimitM} m`,
+                `podstawa chmur spadła z ≥ ${settings.cloudLimitFt} ft do < ${settings.cloudLimitFt} ft`,
+                `pojawiło się VV (niebo niewidoczne) poniżej ${settings.cloudLimitFt} ft`,
+              ]}
+            />
+            <Rule
+              tone="green"
+              title="Alarm „poprawa” ▲"
+              items={[
+                `widzialność wzrosła z < ${settings.visLimitM} m do ≥ ${settings.visLimitM} m (w tym CAVOK)`,
+                `podstawa chmur wzrosła z < ${settings.cloudLimitFt} ft do ≥ ${settings.cloudLimitFt} ft`,
+                "chmury poniżej progu ustąpiły (NSC, SKC, CAVOK)",
+              ]}
+            />
           </div>
           <p className="mt-4 text-sm text-slate-500">
-            Alarm uruchamia się tylko przy <b>zmianie stanu</b> — jeśli warunki utrzymują się poniżej progu przez kilka godzin, sygnał nie powtarza się co 5 minut. Grupy prognozy (TEMPO, BECMG) nie są brane pod uwagę.
+            Alarm uruchamia się tylko przy <b>zmianie stanu</b> — jeśli warunki utrzymują się poniżej progu przez kilka godzin, sygnał nie powtarza się przy każdym odczycie. Grupy prognozy (TEMPO, BECMG) nie są brane pod uwagę.
           </p>
         </section>
 
@@ -565,7 +669,7 @@ export default function App() {
               <div>
                 <p className="text-xs font-semibold uppercase tracking-widest text-amber-400">Test przed zmianą</p>
                 <h3 className="mt-2 text-2xl font-black">Sprawdź, czy alarm Cię obudzi</h3>
-                <p className="mt-2 text-slate-400">Wklej przykładową depeszę i zobacz, jak zareaguje system. Wpisy testowe są oznaczone w dzienniku etykietą „TEST”. Kolejny odczyt prawdziwej strony przywróci rzeczywisty stan.</p>
+                <p className="mt-2 text-slate-400">Wklej przykładową depeszę i zobacz, jak zareaguje system przy obecnych progach ({visLabel} / {cloudLabel}). Wpisy testowe są oznaczone w dzienniku etykietą „TEST”. Kolejny odczyt prawdziwej strony przywróci rzeczywisty stan.</p>
               </div>
               <div className="space-y-3">
                 <input value={sim} onChange={(e) => setSim(e.target.value.toUpperCase())} className="w-full rounded-xl border border-white/15 bg-slate-950 px-4 py-3 font-mono text-amber-200 outline-none focus:border-amber-400" />
@@ -573,7 +677,7 @@ export default function App() {
                   <button onClick={() => { unlockAudio(); setArmed(true); process(sim, true); }} className="rounded-xl bg-amber-400 px-4 py-2.5 text-sm font-bold text-slate-950 hover:bg-amber-300">Symuluj depeszę</button>
                   <button onClick={() => setSim("EPPW 171400Z 24008KT 2500 BR BKN002 08/07 Q1012")} className="rounded-xl border border-white/15 px-3 py-2.5 text-xs hover:bg-white/5">przykład: mgła</button>
                   <button onClick={() => setSim("EPPW 171430Z 24010KT 9999 SCT015 10/06 Q1013")} className="rounded-xl border border-white/15 px-3 py-2.5 text-xs hover:bg-white/5">przykład: poprawa</button>
-                  <button onClick={() => { unlockAudio(); startAlarm(); setAlarm([{ id: "test", detectedAt: new Date().toISOString(), metarTime: "TEST", param: "VIS", direction: "down", value: "test dźwięku", raw: "" }]); }} className="rounded-xl border border-white/15 px-3 py-2.5 text-xs hover:bg-white/5">🔊 tylko test dźwięku</button>
+                  <button onClick={() => { unlockAudio(); startAlarm(); setAlarm([{ id: "test", detectedAt: new Date().toISOString(), metarTime: "TEST", param: "VIS", direction: "down", value: "test dźwięku", raw: "", visLimitM: settings.visLimitM, cloudLimitFt: settings.cloudLimitFt }]); }} className="rounded-xl border border-white/15 px-3 py-2.5 text-xs hover:bg-white/5">🔊 tylko test dźwięku</button>
                 </div>
               </div>
             </div>
@@ -585,19 +689,20 @@ export default function App() {
           <SectionHead kicker="FAQ" title="Najczęstsze pytania" />
           <div className="space-y-3">
             <Faq q="Skąd pochodzą dane?" a="Wprost ze strony metar.czad.org/EPPW — tej samej, którą widzisz w przeglądarce. Strażnik odczytuje jej HTML (element z depeszą oraz zdekodowane pola) i samodzielnie wylicza widzialność oraz podstawę chmur z surowej depeszy. Nie korzysta z żadnego API." />
-            <Faq q="Dlaczego strona jest czytana przez „kanały”, a nie bezpośrednio?" a="Przeglądarka nie może sama pobrać strony z innej domeny, jeśli serwer na to nie zezwala — a metar.czad.org nie wysyła takiej zgody (nagłówków CORS). Publiczne czytniki stron pobierają HTML w naszym imieniu i oddają go z odpowiednimi nagłówkami. Używamy kilku naraz, żeby awaria jednego nie zatrzymała monitoringu. Stan każdego kanału widać w sekcji „Źródło danych”." />
-            <Faq q="Dlaczego co 5 minut, skoro METAR wychodzi co 30 minut?" a="Bo depesze specjalne (SPECI) i korekty mogą pojawić się w dowolnej chwili. Odczyt co 5 minut sprawia, że opóźnienie między publikacją a alarmem wynosi maksymalnie 5 minut. Ta sama depesza nigdy nie wywoła alarmu dwa razy, a po nieudanym odczycie kolejna próba następuje już po minucie." />
-            <Faq q="Który czas mam zapisać — wykrycia czy depeszy?" a="W dzienniku masz oba. „Czas METAR” to moment obserwacji meteorologicznej (oficjalny czas zmiany warunków). „Wykryto” to chwila, w której system zauważył nową depeszę. „RESET” to moment, w którym potwierdziłeś alarm." />
-            <Faq q="Co liczy się jako podstawa chmur?" a="Domyślnie pułap: najniższa warstwa BKN (5–7/8) lub OVC (8/8) albo widzialność pionowa VV. Jeśli Twoja procedura wymaga uwzględnienia również FEW i SCT, zmień ustawienie pod panelem monitora." />
+            <Faq q="Jak zmienić progi 3 km i 300 ft?" a={`W sekcji „Ustawienia” pod monitorem. Próg widzialności podajesz w metrach (50–9999), próg podstawy chmur w stopach (50–5000). Możesz też wybrać gotową wartość jednym kliknięciem. Obecnie obowiązuje ${visLabel} i ${cloudLabel}.`} />
+            <Faq q="Czy zmiana progu wywoła alarm?" a="Nie. Po zapisaniu ustawień bieżące warunki są porównywane z nowymi progami i zapamiętywane jako nowy stan odniesienia, więc syrena nie zabrzmi od samego przestawienia wartości. Jeśli przy nowym progu warunki są już poniżej, monitor po prostu zmieni kolor na czerwony, a alarm zabrzmi dopiero przy następnym przejściu przez próg. Sama zmiana zostaje odnotowana w dzienniku." />
+            <Faq q="Jak często strona może być odczytywana?" a={`Od 1 do 60 minut — ustawiasz w sekcji „Ustawienia”, obecnie co ${intervalLabel}. Skrócenie odstępu działa natychmiast: jeśli od ostatniego odczytu minęło już więcej czasu niż nowy odstęp, kolejny odczyt rusza od razu. Przy bardzo częstym odczycie publiczne czytniki stron mogą zacząć odmawiać — wtedy wydłuż odstęp lub podłącz własny kanał.`} />
+            <Faq q="Który czas mam zapisać — wykrycia czy depeszy?" a="W dzienniku masz oba. „Czas METAR” to moment obserwacji meteorologicznej (oficjalny czas zmiany warunków). „Wykryto” to chwila, w której system zauważył nową depeszę. „RESET” to moment, w którym potwierdziłeś alarm. Przy każdym wpisie zapisany jest też próg, który wtedy obowiązywał." />
+            <Faq q="Co liczy się jako podstawa chmur?" a="Domyślnie pułap: najniższa warstwa BKN (5–7/8) lub OVC (8/8) albo widzialność pionowa VV. Jeśli Twoja procedura wymaga uwzględnienia również FEW i SCT, przełącz to w sekcji „Ustawienia”." />
             <Faq q="Czy muszę trzymać stronę na wierzchu?" a="Nie. Karta może działać w tle — dźwięk zostanie odtworzony, a tytuł karty zacznie migać. Nie zamykaj jednak karty i nie usypiaj komputera. Jeśli zezwolisz na powiadomienia, dostaniesz też komunikat systemowy." />
-            <Faq q="Co się stanie po odświeżeniu strony?" a="Dziennik, ostatni znany stan i czas ostatniej depeszy zostają zapamiętane w przeglądarce. Jeśli w czasie przerwy warunki się zmieniły, alarm uruchomi się zaraz po pierwszym odczycie." />
+            <Faq q="Co się stanie po odświeżeniu strony?" a="Ustawienia, dziennik, ostatni znany stan i czas ostatniej depeszy zostają zapamiętane w przeglądarce. Jeśli w czasie przerwy warunki się zmieniły, alarm uruchomi się zaraz po pierwszym odczycie." />
           </div>
         </section>
       </main>
 
       <footer className="border-t border-white/10">
         <div className="mx-auto flex max-w-6xl flex-col gap-2 px-4 py-8 text-xs text-slate-500 sm:flex-row sm:justify-between">
-          <p>EPPW Strażnik Minimów · narzędzie pomocnicze do monitorowania progów 3 km / 300 ft. Dane: metar.czad.org.</p>
+          <p>EPPW Strażnik Minimów · progi {visLabel} / {cloudLabel}, odczyt co {intervalLabel}. Dane: metar.czad.org.</p>
           <p>Nie stanowi oficjalnego źródła informacji meteorologicznej. Decyzje operacyjne podejmuj na podstawie oficjalnych serwisów.</p>
         </div>
       </footer>
@@ -644,14 +749,16 @@ function StatusPill({ below, alarm, ready }: { below: boolean; alarm: boolean; r
   );
 }
 
-function HeroStat({ label, value, sub }: { label: string; value: string; sub: string }) {
-  return (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+function HeroStat({ label, value, sub, href }: { label: string; value: string; sub: string; href?: string }) {
+  const inner = (
+    <>
       <p className="text-xs uppercase tracking-widest text-slate-500">{label}</p>
       <p className="mt-1 text-3xl font-black text-white">{value}</p>
       <p className="mt-1 text-xs text-slate-400">{sub}</p>
-    </div>
+    </>
   );
+  const cls = "block rounded-2xl border border-white/10 bg-white/[0.03] p-5 transition-colors";
+  return href ? <a href={href} className={cn(cls, "hover:border-amber-400/40 hover:bg-amber-400/[0.06]")}>{inner}</a> : <div className={cls}>{inner}</div>;
 }
 
 function SectionHead({ kicker, title, text }: { kicker: string; title: string; text?: string }) {
@@ -665,6 +772,7 @@ function SectionHead({ kicker, title, text }: { kicker: string; title: string; t
 }
 
 function Gauge({ title, value, limit, state, ratio, mark }: { title: string; value: string; limit: string; state: boolean | null; ratio: number; mark: number }) {
+  const markPct = Math.min(96, Math.max(4, mark * 100));
   return (
     <div className={cn("rounded-2xl border p-5", state === null ? "border-white/10" : state ? "border-red-500/40 bg-red-500/[0.07]" : "border-emerald-500/30 bg-emerald-500/[0.05]")}>
       <div className="flex items-start justify-between gap-2">
@@ -676,9 +784,11 @@ function Gauge({ title, value, limit, state, ratio, mark }: { title: string; val
       <p className="mt-2 text-4xl font-black tabular-nums sm:text-5xl">{value}</p>
       <div className="relative mt-5 h-2.5 rounded-full bg-slate-800">
         <div className={cn("h-full rounded-full transition-all duration-700", state ? "bg-red-500" : "bg-emerald-500")} style={{ width: `${Math.max(2, ratio * 100)}%` }} />
-        <div className="absolute -top-1.5 h-5 w-0.5 bg-amber-400" style={{ left: `${mark * 100}%` }} />
+        <div className="absolute -top-1.5 h-5 w-0.5 bg-amber-400 transition-all duration-500" style={{ left: `${markPct}%` }} />
       </div>
-      <p className="mt-2 text-xs text-amber-400/80" style={{ paddingLeft: `calc(${mark * 100}% - 1.5rem)` }}>{limit}</p>
+      <div className="relative mt-2 h-4">
+        <span className="absolute -translate-x-1/2 whitespace-nowrap text-xs text-amber-400/80 transition-all duration-500" style={{ left: `${markPct}%` }}>{limit}</span>
+      </div>
     </div>
   );
 }
