@@ -39,7 +39,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './built' # Użyj './build' jeśli korzystasz z Create React App
+          path: './dist' # Użyj './build' jeśli korzystasz z Create React App
 
   deploy:
     environment:
