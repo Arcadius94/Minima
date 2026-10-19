@@ -78,7 +78,7 @@ export default function SettingsPanel({ settings, onApply }: Props) {
           value={draft.cloud}
           onChange={(v) => set({ cloud: v })}
           error={errors.cloud}
-          hint={`Zakres ${BOUNDS.cloud.min}–${BOUNDS.cloud.max} ft. METAR podaje podstawę co 100 ft — próg 150 ft oznacza alarm przy podstawie 100 ft i niżej.`}
+          hint={`Zakres ${BOUNDS.cloud.min}–${BOUNDS.cloud.max} ft. METAR podaje podstawę co 100 ft.`}
           presets={PRESETS.cloud.map((p) => ({ value: String(p), label: fmtCloudLimit(p) }))}
           current={draft.cloud}
         />
