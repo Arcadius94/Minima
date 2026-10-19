@@ -120,11 +120,19 @@ export interface Evaluation {
   cloudBaseFt: number | null;
 }
 
-export function evaluate(p: ParsedMetar, mode: CloudMode): Evaluation {
+/** Progi alarmowe — konfigurowalne przez użytkownika. */
+export interface Thresholds {
+  visLimitM: number;
+  cloudLimitFt: number;
+}
+
+export const DEFAULT_THRESHOLDS: Thresholds = { visLimitM: VIS_LIMIT_M, cloudLimitFt: CLOUD_LIMIT_FT };
+
+export function evaluate(p: ParsedMetar, mode: CloudMode, th: Thresholds = DEFAULT_THRESHOLDS): Evaluation {
   const cloudBaseFt = relevantCloudBase(p, mode);
   return {
-    visBelow: p.visibilityM === null ? null : p.visibilityM < VIS_LIMIT_M,
-    cloudBelow: cloudBaseFt === null ? false : cloudBaseFt < CLOUD_LIMIT_FT,
+    visBelow: p.visibilityM === null ? null : p.visibilityM < th.visLimitM,
+    cloudBelow: cloudBaseFt === null ? false : cloudBaseFt < th.cloudLimitFt,
     cloudBaseFt,
   };
 }
