@@ -27,8 +27,8 @@ export const BOUNDS = {
 
 export const PRESETS = {
   vis: [1500, 3000, 5000],
-  cloud: [150, 300, 1500],
-  refreshMin: [1, 2, 5, 10, 15, 30],
+  cloud: [500, 1000, 1500],
+  refreshMin: [1, 2, 5],
 };
 
 const KEY = "eppw-settings-v2";
